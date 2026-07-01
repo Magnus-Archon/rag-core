@@ -113,7 +113,26 @@ async function ask() {
 
   try {
     const res = await fetch('/api/ask', { method: 'POST', body: formData });
-    const data = await res.json();
+    
+    if (!res.ok) {
+      status.textContent = `Error: HTTP ${res.status}`;
+      return;
+    }
+
+    const text = await res.text();
+    if (!text) {
+      status.textContent = 'Error: Empty response from server';
+      return;
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (parseErr) {
+      status.textContent = 'Error: Invalid JSON response - ' + parseErr.message;
+      return;
+    }
+
     status.textContent = '';
 
     let sourcesHtml = '';
@@ -127,7 +146,7 @@ async function ask() {
 
     result.innerHTML = `<div class="answer">${data.answer}</div>${sourcesHtml}`;
   } catch (err) {
-    status.textContent = 'Error: ' + err;
+    status.textContent = 'Error: ' + err.message;
   } finally {
     sendBtn.disabled = false;
   }
