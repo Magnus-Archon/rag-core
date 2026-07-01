@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Local RAG</title>
+<style>
+  :root { --bg:#0f1117; --panel:#171923; --border:#2a2d3a; --accent:#6366f1; --text:#e5e7eb; --muted:#9ca3af; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center; padding: 40px 16px;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 24px; }
+  .container { width: 100%; max-width: 720px; }
+
+  /* The combined input box: chips + textarea + toolbar all live in ONE box */
+  .input-box {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 10px 10px 10px 14px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: flex; align-items: center; gap: 6px; background: #232636;
+    border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; font-size: 13px;
+  }
+  .chip button {
+    background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1;
+  }
+  textarea {
+    width: 100%; min-height: 60px; resize: vertical; background: transparent; border: none;
+    outline: none; color: var(--text); font-size: 15px; font-family: inherit;
+  }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; }
+  .toolbar .left { display: flex; gap: 8px; }
+  .icon-btn {
+    background: #232636; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 13px;
+  }
+  .icon-btn:hover { color: var(--text); }
+  .send-btn {
+    background: var(--accent); border: none; color: white; border-radius: 8px;
+    padding: 8px 18px; cursor: pointer; font-size: 14px; font-weight: 600;
+  }
+  .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  #result { margin-top: 28px; }
+  .answer { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; white-space: pre-wrap; line-height: 1.5; }
+  .sources { margin-top: 14px; font-size: 13px; color: var(--muted); }
+  .sources a { color: #93c5fd; }
+  .status { color: var(--muted); font-size: 13px; margin-top: 10px; }
+</style>
+</head>
+<body>
+  <h1>Local RAG — web search + your files</h1>
+  <div class="container">
+
+    <div class="input-box">
+      <!-- uploaded files render as chips INSIDE this same box, right above the text -->
+      <div class="chips" id="chips"></div>
+      <textarea id="query" placeholder="Ask anything... (uploaded files are included as context)"></textarea>
+      <div class="toolbar">
+        <div class="left">
+          <button class="icon-btn" onclick="document.getElementById('fileInput').click()">+ Attach files</button>
+          <input type="file" id="fileInput" multiple accept=".pdf,.txt,.md" style="display:none">
+        </div>
+        <button class="send-btn" id="sendBtn" onclick="ask()">Ask</button>
+      </div>
+    </div>
+
+    <div class="status" id="status"></div>
+    <div id="result"></div>
+  </div>
+
+<script>
+let attachedFiles = [];
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  attachedFiles = attachedFiles.concat(Array.from(e.target.files));
+  renderChips();
+});
+
+function renderChips() {
+  const chips = document.getElementById('chips');
+  chips.innerHTML = '';
+  attachedFiles.forEach((f, i) => {
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    chip.innerHTML = `📄 ${f.name} <button onclick="removeFile(${i})">×</button>`;
+    chips.appendChild(chip);
+  });
+}
+
+function removeFile(i) {
+  attachedFiles.splice(i, 1);
+  renderChips();
+}
+
+async function ask() {
+  const query = document.getElementById('query').value.trim();
+  if (!query) return;
+
+  const sendBtn = document.getElementById('sendBtn');
+  const status = document.getElementById('status');
+  const result = document.getElementById('result');
+  sendBtn.disabled = true;
+  status.textContent = 'Searching, reading sources, and generating an answer...';
+  result.innerHTML = '';
+
+  const formData = new FormData();
+  formData.append('query', query);
+  attachedFiles.forEach(f => formData.append('files', f));
+
+  try {
+    const res = await fetch('/api/ask', { method: 'POST', body: formData });
+    const data = await res.json();
+    status.textContent = '';
+
+    let sourcesHtml = '';
+    if (data.sources && data.sources.length) {
+      sourcesHtml += '<div class="sources"><b>Web sources:</b><br>' +
+        data.sources.map(u => `<a href="${u}" target="_blank">${u}</a>`).join('<br>') + '</div>';
+    }
+    if (data.files && data.files.length) {
+      sourcesHtml += '<div class="sources"><b>Files used:</b> ' + data.files.join(', ') + '</div>';
+    }
+
+    result.innerHTML = `<div class="answer">${data.answer}</div>${sourcesHtml}`;
+  } catch (err) {
+    status.textContent = 'Error: ' + err;
+  } finally {
+    sendBtn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
