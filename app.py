@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from rag_core import run_pipeline
@@ -35,5 +35,10 @@ async def ask(query: str = Form(...), files: list[UploadFile] = File(default=[])
 
         result = run_pipeline(query, file_paths)
         return result
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e), "answer": f"Error: {str(e)}", "sources": [], "files": []}
+        )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
