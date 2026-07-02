@@ -34,7 +34,11 @@ async def health():
 
 
 @app.post("/api/ask")
-async def ask(query: str = Form(...), files: list[UploadFile] = File(default=[])):
+async def ask(
+    query: str = Form(...),
+    scope: str = Form("auto"),
+    files: list[UploadFile] = File(default=[]),
+):
     tmp_dir = tempfile.mkdtemp()
     file_paths = []
     try:
@@ -46,7 +50,7 @@ async def ask(query: str = Form(...), files: list[UploadFile] = File(default=[])
                 shutil.copyfileobj(f.file, out)
             file_paths.append(str(dest))
 
-        result = run_pipeline(query, file_paths)
+        result = run_pipeline(query, file_paths, scope=scope)
         return result
     except Exception as e:
         # Always return JSON on failure -- never let an unhandled exception

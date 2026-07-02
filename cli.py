@@ -16,7 +16,7 @@ if __name__ == "__main__":
     else:
         query_parts, file_paths = args, []
 
-    result = run_pipeline(" ".join(query_parts), file_paths)
+    result = run_pipeline(" ".join(query_parts), file_paths, scope="auto")
 
     print("\n=== ANSWER ===")
     print(result["answer"])

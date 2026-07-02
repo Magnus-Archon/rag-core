@@ -56,6 +56,18 @@ def get_reranker():
     return _reranker
 
 
+def _memory_is_tight(min_free_mb: int = 300) -> bool:
+    """True if free RAM is too low to safely load the reranker.
+    Fails open (returns False -> reranker allowed) if psutil isn't available
+    or the check itself errors, so this never blocks the pipeline."""
+    try:
+        import psutil
+        available_mb = psutil.virtual_memory().available / (1024 * 1024)
+        return available_mb < min_free_mb
+    except Exception:
+        return False
+
+
 def web_search(query: str, max_results: int = NUM_SEARCH_RESULTS) -> list[dict]:
     """Tavily first (better quality, needs TAVILY_API_KEY); falls back to
     DuckDuckGo (free, no key) if Tavily isn't configured or fails.
@@ -173,8 +185,18 @@ def generate_answer(query: str, context_chunks: list[str], client) -> str:
     return response.text
 
 
-def run_pipeline(query: str, file_paths: list[str] | None = None) -> dict:
-    """End-to-end: search + files -> retrieve -> rerank -> generate. Returns dict for API/CLI use."""
+def run_pipeline(query: str, file_paths: list[str] | None = None, scope: str = "auto") -> dict:
+    """End-to-end: search + files -> retrieve -> rerank -> generate.
+
+    scope:
+      "auto"  - if files are attached, use files only (this is what makes it
+                actually RAG over your document instead of drowning it in
+                unrelated web search results for short/generic queries);
+                otherwise search the web.
+      "web"   - web search only, ignore attached files.
+      "files" - attached files only, no web search.
+      "both"  - web search AND attached files.
+    """
     from google import genai
 
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -182,20 +204,27 @@ def run_pipeline(query: str, file_paths: list[str] | None = None) -> dict:
         raise RuntimeError("GEMINI_API_KEY is not set")
     client = genai.Client(api_key=api_key)
 
-    results = web_search(query)
-    urls = [r["href"] for r in results]
+    file_paths = file_paths or []
+    if scope == "auto":
+        scope = "files" if file_paths else "web"
 
+    urls: list[str] = []
     all_chunks: list[str] = []
-    for url in urls:
-        text = scrape(url)
-        if text:
-            all_chunks.extend(chunk_text(text))
 
-    filenames = [Path(p).name for p in (file_paths or [])]
-    for path in (file_paths or []):
-        text = parse_file(path)
-        if text:
-            all_chunks.extend(chunk_text(text))
+    if scope in ("web", "both"):
+        results = web_search(query)
+        urls = [r["href"] for r in results]
+        for url in urls:
+            text = scrape(url)
+            if text:
+                all_chunks.extend(chunk_text(text))
+
+    filenames = [Path(p).name for p in file_paths]
+    if scope in ("files", "both"):
+        for path in file_paths:
+            text = parse_file(path)
+            if text:
+                all_chunks.extend(chunk_text(text))
 
     if not all_chunks:
         return {"answer": "No content could be retrieved for this query.", "sources": [], "files": filenames}
@@ -204,8 +233,18 @@ def run_pipeline(query: str, file_paths: list[str] | None = None) -> dict:
     index, bm25 = build_index(all_chunks, embedder)
 
     candidates = hybrid_retrieve(query, all_chunks, index, bm25, embedder)
-    reranker = get_reranker()
-    top_chunks = rerank(query, candidates, reranker)
+
+    # Reranking is a quality nice-to-have, not a correctness requirement --
+    # hybrid_retrieve already returns reasonably-ordered candidates. Skip it
+    # under memory pressure (or if it fails to load for any reason) rather
+    # than risking an OOM kill.
+    top_chunks = candidates[:TOP_K_RERANK]
+    if not _memory_is_tight():
+        try:
+            reranker = get_reranker()
+            top_chunks = rerank(query, candidates, reranker)
+        except Exception as e:
+            print(f"Reranker unavailable, using un-reranked top candidates: {e}")
 
     answer = generate_answer(query, top_chunks, client)
 
