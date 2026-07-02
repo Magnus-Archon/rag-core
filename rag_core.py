@@ -1,17 +1,19 @@
-"""Shared RAG pipeline: web search + file ingestion + hybrid retrieval + Gemini generation."""
+"""Shared RAG pipeline: web search + file ingestion + hybrid retrieval + Gemini generation.
+
+Heavy ML libraries (torch, sentence-transformers, faiss, fitz) are imported
+LAZILY inside functions, not at module load time. This is critical for
+Render deploys: Uvicorn imports this module before it binds the port, so a
+slow top-level import (torch can take a long time on a slow/free-tier CPU)
+can blow past Render's port-scan timeout and the deploy fails with
+"Port scan timeout reached, no open ports detected" even though the app
+would have started fine given more time. Lazy imports keep startup instant;
+the cost is paid on the first real request instead, which has a much longer
+timeout budget.
+"""
 from __future__ import annotations
 
 import os
 from pathlib import Path
-
-import numpy as np
-from ddgs import DDGS
-import trafilatura
-import fitz  # PyMuPDF
-from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer, CrossEncoder
-import faiss
-from google import genai
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -24,31 +26,60 @@ TOP_K_RERANK = 5
 NUM_SEARCH_RESULTS = 6
 
 # Models are expensive to load; load once and reuse across requests.
-_embedder: SentenceTransformer | None = None
-_reranker: CrossEncoder | None = None
+_embedder = None
+_reranker = None
 
 
-def get_embedder() -> SentenceTransformer:
+def get_embedder():
     global _embedder
     if _embedder is None:
+        from sentence_transformers import SentenceTransformer
         _embedder = SentenceTransformer(EMBED_MODEL)
     return _embedder
 
 
-def get_reranker() -> CrossEncoder:
+def get_reranker():
     global _reranker
     if _reranker is None:
+        from sentence_transformers import CrossEncoder
         _reranker = CrossEncoder(RERANK_MODEL)
     return _reranker
 
 
 def web_search(query: str, max_results: int = NUM_SEARCH_RESULTS) -> list[dict]:
-    with DDGS() as ddgs:
-        return list(ddgs.text(query, max_results=max_results))
+    """Tavily first (better quality, needs TAVILY_API_KEY); falls back to
+    DuckDuckGo (free, no key) if Tavily isn't configured or fails.
+    Always returns a normalized list of {"href": ..., "title": ...} dicts.
+    """
+    tavily_key = os.environ.get("TAVILY_API_KEY")
+    if tavily_key:
+        try:
+            from tavily import TavilyClient
+            client = TavilyClient(api_key=tavily_key)
+            resp = client.search(query, max_results=max_results)
+            results = [
+                {"href": r["url"], "title": r.get("title", "")}
+                for r in resp.get("results", [])
+                if r.get("url")
+            ]
+            if results:
+                return results
+        except Exception as e:
+            print(f"Tavily search failed, falling back to DuckDuckGo: {e}")
+
+    try:
+        from ddgs import DDGS
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(query, max_results=max_results))
+        return [{"href": r["href"], "title": r.get("title", "")} for r in raw if "href" in r]
+    except Exception as e:
+        print(f"DuckDuckGo search failed: {e}")
+        return []
 
 
 def scrape(url: str) -> str | None:
     try:
+        import trafilatura
         downloaded = trafilatura.fetch_url(url)
         if not downloaded:
             return None
@@ -61,6 +92,7 @@ def parse_file(path: str) -> str | None:
     ext = Path(path).suffix.lower()
     try:
         if ext == ".pdf":
+            import fitz  # PyMuPDF
             doc = fitz.open(path)
             return "\n\n".join(page.get_text("text") for page in doc)
         elif ext in (".txt", ".md"):
@@ -80,7 +112,11 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
     return [c for c in chunks if len(c.strip()) > 50]
 
 
-def build_index(chunks: list[str], embedder: SentenceTransformer):
+def build_index(chunks: list[str], embedder):
+    import numpy as np
+    import faiss
+    from rank_bm25 import BM25Okapi
+
     embeddings = embedder.encode(chunks, normalize_embeddings=True)
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(np.array(embeddings, dtype="float32"))
@@ -89,6 +125,8 @@ def build_index(chunks: list[str], embedder: SentenceTransformer):
 
 
 def hybrid_retrieve(query, chunks, index, bm25, embedder, top_k=TOP_K_RETRIEVE):
+    import numpy as np
+
     q_emb = embedder.encode([query], normalize_embeddings=True)
     _, dense_ids = index.search(np.array(q_emb, dtype="float32"), min(top_k, len(chunks)))
 
@@ -103,14 +141,14 @@ def hybrid_retrieve(query, chunks, index, bm25, embedder, top_k=TOP_K_RETRIEVE):
     return merged
 
 
-def rerank(query: str, candidates: list[str], reranker: CrossEncoder, top_k=TOP_K_RERANK) -> list[str]:
+def rerank(query: str, candidates: list[str], reranker, top_k=TOP_K_RERANK) -> list[str]:
     pairs = [(query, c) for c in candidates]
     scores = reranker.predict(pairs)
     ranked = [c for _, c in sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)]
     return ranked[:top_k]
 
 
-def generate_answer(query: str, context_chunks: list[str], client: genai.Client) -> str:
+def generate_answer(query: str, context_chunks: list[str], client) -> str:
     context = "\n\n".join(context_chunks)[:8000]
     prompt = (
         f"Answer the question using only the context below. "
@@ -123,13 +161,15 @@ def generate_answer(query: str, context_chunks: list[str], client: genai.Client)
 
 def run_pipeline(query: str, file_paths: list[str] | None = None) -> dict:
     """End-to-end: search + files -> retrieve -> rerank -> generate. Returns dict for API/CLI use."""
+    from google import genai
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
     client = genai.Client(api_key=api_key)
 
     results = web_search(query)
-    urls = [r["href"] for r in results if "href" in r]
+    urls = [r["href"] for r in results]
 
     all_chunks: list[str] = []
     for url in urls:

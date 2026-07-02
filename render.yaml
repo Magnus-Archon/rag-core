@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: local-rag
+    env: docker
+    plan: free
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+    healthCheckPath: /health

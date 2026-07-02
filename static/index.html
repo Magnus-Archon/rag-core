@@ -113,27 +113,18 @@ async function ask() {
 
   try {
     const res = await fetch('/api/ask', { method: 'POST', body: formData });
-    
-    if (!res.ok) {
-      status.textContent = `Error: HTTP ${res.status}`;
-      return;
-    }
-
-    const text = await res.text();
-    if (!text) {
-      status.textContent = 'Error: Empty response from server';
-      return;
-    }
-
+    const raw = await res.text();
     let data;
     try {
-      data = JSON.parse(text);
-    } catch (parseErr) {
-      status.textContent = 'Error: Invalid JSON response - ' + parseErr.message;
-      return;
+      data = JSON.parse(raw);
+    } catch {
+      throw new Error(`Server returned a non-JSON response (status ${res.status}). Check server logs.`);
     }
-
     status.textContent = '';
+
+    if (!res.ok) {
+      throw new Error(data.error || `Request failed (status ${res.status})`);
+    }
 
     let sourcesHtml = '';
     if (data.sources && data.sources.length) {
