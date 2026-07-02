@@ -24,7 +24,6 @@ import gc
 from pathlib import Path
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
-RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 GEN_MODEL = "gemini-2.5-flash"
 
 CHUNK_SIZE = 500
@@ -33,9 +32,8 @@ TOP_K_RETRIEVE = 12
 TOP_K_RERANK = 5
 NUM_SEARCH_RESULTS = 4
 
-# Models are expensive to load; load once and reuse across requests.
+# Embedder is expensive to load; load once and reuse across requests.
 _embedder = None
-_reranker = None
 
 
 def get_embedder():
@@ -46,26 +44,6 @@ def get_embedder():
         from sentence_transformers import SentenceTransformer
         _embedder = SentenceTransformer(EMBED_MODEL, device="cpu")
     return _embedder
-
-
-def get_reranker():
-    global _reranker
-    if _reranker is None:
-        from sentence_transformers import CrossEncoder
-        _reranker = CrossEncoder(RERANK_MODEL, device="cpu")
-    return _reranker
-
-
-def _memory_is_tight(min_free_mb: int = 300) -> bool:
-    """True if free RAM is too low to safely load the reranker.
-    Fails open (returns False -> reranker allowed) if psutil isn't available
-    or the check itself errors, so this never blocks the pipeline."""
-    try:
-        import psutil
-        available_mb = psutil.virtual_memory().available / (1024 * 1024)
-        return available_mb < min_free_mb
-    except Exception:
-        return False
 
 
 def web_search(query: str, max_results: int = NUM_SEARCH_RESULTS) -> list[dict]:
@@ -167,13 +145,6 @@ def hybrid_retrieve(query, chunks, index, bm25, embedder, top_k=TOP_K_RETRIEVE):
     return merged
 
 
-def rerank(query: str, candidates: list[str], reranker, top_k=TOP_K_RERANK) -> list[str]:
-    pairs = [(query, c) for c in candidates]
-    scores = reranker.predict(pairs)
-    ranked = [c for _, c in sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)]
-    return ranked[:top_k]
-
-
 def generate_answer(query: str, context_chunks: list[str], client) -> str:
     context = "\n\n".join(context_chunks)[:8000]
     prompt = (
@@ -186,7 +157,7 @@ def generate_answer(query: str, context_chunks: list[str], client) -> str:
 
 
 def run_pipeline(query: str, file_paths: list[str] | None = None, scope: str = "auto") -> dict:
-    """End-to-end: search + files -> retrieve -> rerank -> generate.
+    """End-to-end: search + files -> hybrid retrieve -> generate.
 
     scope:
       "auto"  - if files are attached, use files only (this is what makes it
@@ -233,18 +204,7 @@ def run_pipeline(query: str, file_paths: list[str] | None = None, scope: str = "
     index, bm25 = build_index(all_chunks, embedder)
 
     candidates = hybrid_retrieve(query, all_chunks, index, bm25, embedder)
-
-    # Reranking is a quality nice-to-have, not a correctness requirement --
-    # hybrid_retrieve already returns reasonably-ordered candidates. Skip it
-    # under memory pressure (or if it fails to load for any reason) rather
-    # than risking an OOM kill.
     top_chunks = candidates[:TOP_K_RERANK]
-    if not _memory_is_tight():
-        try:
-            reranker = get_reranker()
-            top_chunks = rerank(query, candidates, reranker)
-        except Exception as e:
-            print(f"Reranker unavailable, using un-reranked top candidates: {e}")
 
     answer = generate_answer(query, top_chunks, client)
 
