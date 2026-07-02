@@ -13,6 +13,14 @@ timeout budget.
 from __future__ import annotations
 
 import os
+
+# Must be set before torch is imported (via sentence-transformers). Multi-threaded
+# BLAS/torch ops can multiply memory usage on small containers (e.g. Render's
+# 512MB free tier) and cause OOM kills. Cap it hard.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import gc
 from pathlib import Path
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
@@ -21,9 +29,9 @@ GEN_MODEL = "gemini-2.5-flash"
 
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
-TOP_K_RETRIEVE = 15
+TOP_K_RETRIEVE = 12
 TOP_K_RERANK = 5
-NUM_SEARCH_RESULTS = 6
+NUM_SEARCH_RESULTS = 4
 
 # Models are expensive to load; load once and reuse across requests.
 _embedder = None
@@ -33,8 +41,10 @@ _reranker = None
 def get_embedder():
     global _embedder
     if _embedder is None:
+        import torch
+        torch.set_num_threads(1)
         from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer(EMBED_MODEL)
+        _embedder = SentenceTransformer(EMBED_MODEL, device="cpu")
     return _embedder
 
 
@@ -42,7 +52,7 @@ def get_reranker():
     global _reranker
     if _reranker is None:
         from sentence_transformers import CrossEncoder
-        _reranker = CrossEncoder(RERANK_MODEL)
+        _reranker = CrossEncoder(RERANK_MODEL, device="cpu")
     return _reranker
 
 
@@ -95,6 +105,10 @@ def parse_file(path: str) -> str | None:
             import fitz  # PyMuPDF
             doc = fitz.open(path)
             return "\n\n".join(page.get_text("text") for page in doc)
+        elif ext == ".docx":
+            import docx
+            doc = docx.Document(path)
+            return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
         elif ext in (".txt", ".md"):
             return Path(path).read_text(encoding="utf-8", errors="replace")
         return None
@@ -195,4 +209,12 @@ def run_pipeline(query: str, file_paths: list[str] | None = None) -> dict:
 
     answer = generate_answer(query, top_chunks, client)
 
-    return {"answer": answer, "sources": urls, "files": filenames}
+    result = {"answer": answer, "sources": urls, "files": filenames}
+
+    # These can be sizable (full page text, embeddings, FAISS index) --
+    # drop them explicitly rather than waiting on Python's GC, since a
+    # small-RAM container (e.g. Render free tier) has little headroom.
+    del all_chunks, index, bm25, candidates, top_chunks
+    gc.collect()
+
+    return result
